@@ -1,0 +1,447 @@
+#!/bin/sh
+# roulette — switch Claude Code between your own subscription accounts.
+#
+# Tokens live in the macOS Keychain (service "roulette:<name>").
+# Everything else lives in $CONFIG_DIR/state.json and is never secret.
+
+ROULETTE_VERSION=0.1.0
+CONFIG_DIR=${ROULETTE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/roulette}
+STATE=$CONFIG_DIR/state.json
+EMPTY_STATE='{"accounts":[],"usernames":{},"usage":{}}'
+
+die() {
+  printf 'roulette: %s\n' "$*" >&2
+  exit 1
+}
+
+now() {
+  printf '%s\n' "${ROULETTE_NOW:-$(date +%s)}"
+}
+
+need_jq() {
+  command -v jq >/dev/null 2>&1 || die "jq is required. Install it with: brew install jq"
+}
+
+valid_name() {
+  case $1 in
+    '' | *[!A-Za-z0-9_-]*) return 1 ;;
+  esac
+  return 0
+}
+
+# --- secrets: macOS Keychain. Linux support = reimplement these three. ---
+
+secret_set() {
+  # Fed through `security -i` on stdin so the token never shows up in `ps`.
+  printf 'add-generic-password -U -a %s -s roulette:%s -w %s\n' "$USER" "$1" "$2" |
+    security -i >/dev/null 2>&1
+}
+
+secret_get() {
+  security find-generic-password -a "$USER" -s "roulette:$1" -w 2>/dev/null
+}
+
+secret_del() {
+  security delete-generic-password -a "$USER" -s "roulette:$1" >/dev/null 2>&1
+}
+
+# --- state ---
+
+state_read() {
+  if [ ! -f "$STATE" ]; then
+    printf '%s\n' "$EMPTY_STATE"
+    return 0
+  fi
+  jq -e . "$STATE" >/dev/null 2>&1 || die "state file is corrupt: $STATE"
+  cat "$STATE"
+}
+
+# state_lock — mkdir is atomic, so it doubles as a lock between concurrent roulette runs.
+state_lock() {
+  _sl_i=0
+  while ! mkdir "$CONFIG_DIR/.lock" 2>/dev/null; do
+    _sl_i=$((_sl_i + 1))
+    if [ "$_sl_i" -ge 50 ]; then
+      # Held for ~5s: assume a crashed writer left it behind.
+      rmdir "$CONFIG_DIR/.lock" 2>/dev/null
+      mkdir "$CONFIG_DIR/.lock" 2>/dev/null
+      return
+    fi
+    sleep 0.1
+  done
+}
+
+state_unlock() {
+  rmdir "$CONFIG_DIR/.lock" 2>/dev/null
+}
+
+# state_update <jq filter> [jq args...] — locked, atomic read-modify-write.
+state_update() {
+  _su_filter=$1
+  shift
+  mkdir -p "$CONFIG_DIR" || return 1
+  state_lock || return 1
+  _su_rc=1
+  if _su_state=$(state_read) && _su_tmp=$(mktemp "$CONFIG_DIR/.state.XXXXXX"); then
+    if printf '%s\n' "$_su_state" | jq "$@" "$_su_filter" >"$_su_tmp" 2>/dev/null && [ -s "$_su_tmp" ]; then
+      mv "$_su_tmp" "$STATE" && _su_rc=0
+    else
+      rm -f "$_su_tmp"
+    fi
+  fi
+  state_unlock
+  return "$_su_rc"
+}
+
+has_account() {
+  state_read | jq -e --arg n "$1" 'any(.accounts[]; . == $n)' >/dev/null 2>&1
+}
+
+require_account() {
+  has_account "$1" && return 0
+  _ra_names=$(state_read | jq -r '.accounts | join(", ")')
+  [ -n "$_ra_names" ] || die "no accounts yet. Add one with: roulette add <name>"
+  die "unknown account '$1'. Accounts: $_ra_names"
+}
+
+# --- shared jq library: formatting, usage estimates, ranking ---
+
+JQ_LIB='
+def pad($w): tostring | . + (" " * ([$w - length, 0] | max));
+def lpad($w): tostring | (" " * ([$w - length, 0] | max)) + .;
+def bar($p): [range(8)] | map(if . < (($p / 12.5) | round) then "▰" else "▱" end) | join("");
+def cell($v; $est):
+  if $v == null then ("?" | pad(14))
+  else bar($v) + " " + (($v | round | tostring) + "%" | lpad(4)) + (if $est then "~" else " " end)
+  end;
+def eff($now):
+  if . == null then {five: null, seven: null, seen: null, est5: false, est7: false}
+  else ($now - .seen) as $age
+    | (((.resets_at | type) == "number") and ($now >= .resets_at)) as $reset
+    | {seen: .seen,
+       est5: ($age > 18000 or $reset),
+       est7: ($age > 604800),
+       five: (if ($age > 18000 or $reset) then 0 else .five_hour end),
+       seven: (if $age > 604800 then 0 else .seven_day end)}
+  end;
+def rows($now):
+  . as $s | [.accounts[] as $n | {name: $n, username: $s.usernames[$n]} + ($s.usage[$n] | eff($now))];
+def ago($now):
+  if . == null then "never"
+  else ($now - .) as $d
+    | if $d < 60 then "now"
+      elif $d < 3600 then "\($d / 60 | floor)m ago"
+      elif $d < 86400 then "\($d / 3600 | floor)h ago"
+      else "\($d / 86400 | floor)d ago" end
+  end;
+def ranked($now; $cur):
+  rows($now)
+  | map(select(.name != $cur and ((.seven // 0) < 100)))
+  | sort_by((if .five == null then 50 elif .five < 50 then .five else .five + 1 end), (.seen // 0));
+'
+
+# --- commands ---
+
+cmd_list() {
+  _st=$(state_read) || exit 1
+  printf '%s\n' "$_st" | jq -r --arg cur "${ROULETTE_ACCOUNT:-}" '
+    if (.accounts | length) == 0 then "no accounts yet. Add one with: roulette add <name>"
+    else . as $s
+      | ([.accounts[] | length, 4] | max) as $w
+      | .accounts[] as $n
+      | (if $n == $cur then "* " else "  " end)
+        + ($n + (" " * ([$w - ($n | length), 0] | max))) + "  "
+        + ($s.usernames[$n] // "(unknown)")
+    end'
+}
+
+# --- account identity ---
+
+# detect_username <token> — prints the account's email, or nothing.
+# The field name in `claude auth status --json` is not documented, so try the likely ones.
+detect_username() {
+  CLAUDE_CODE_OAUTH_TOKEN=$1 claude auth status --json 2>/dev/null |
+    jq -r '[.email, .emailAddress, .account.email, .account.emailAddress, .user.email]
+           | map(select(type == "string" and . != "")) | first // empty' 2>/dev/null
+}
+
+# set_username <name> <token>
+set_username() {
+  _su_user=$(detect_username "$2")
+  if [ -z "$_su_user" ]; then
+    state_update '.usernames[$n] = null' --arg n "$1" || die "could not update $STATE"
+    printf "%s → (unknown — run 'roulette refresh %s', or set it with 'roulette refresh %s <email>')\n" "$1" "$1" "$1"
+    return 0
+  fi
+  state_update '.usernames[$n] = $u' --arg n "$1" --arg u "$_su_user" || die "could not update $STATE"
+  printf '%s → %s\n' "$1" "$_su_user"
+  _su_dupe=$(state_read | jq -r --arg n "$1" --arg u "$_su_user" \
+    '.usernames | to_entries[] | select(.key != $n and .value == $u) | .key' | head -n 1)
+  if [ -n "$_su_dupe" ]; then
+    printf "roulette: warning: '%s' reports the same login as '%s'. Either the same account was used for both tokens, or Claude Code is reporting this machine's login instead of the token's. Set the right one with: roulette refresh %s <email>\n" "$1" "$_su_dupe" "$1" >&2
+  fi
+  return 0
+}
+
+cmd_add() {
+  _force=0
+  _name=
+  for _a in "$@"; do
+    case $_a in
+      --force) _force=1 ;;
+      -*) die "unknown option: $_a" ;;
+      *)
+        [ -z "$_name" ] || die "usage: roulette add <name> [--force]"
+        _name=$_a
+        ;;
+    esac
+  done
+  [ -n "$_name" ] || die "usage: roulette add <name> [--force]"
+  valid_name "$_name" || die "account names may only use letters, digits, '-' and '_'"
+  if [ "$_force" -eq 0 ] && has_account "$_name"; then
+    die "account '$_name' already exists (use --force to replace its token)"
+  fi
+
+  cat >&2 <<EOF
+Run this in another terminal and sign in, in the browser, as the account you want to call '$_name':
+
+    claude setup-token
+
+Then paste the token it prints.
+EOF
+  printf 'Token: ' >&2
+  if [ -t 0 ]; then
+    trap 'stty echo 2>/dev/null' EXIT INT TERM
+    stty -echo
+  fi
+  IFS= read -r _token || true
+  if [ -t 0 ]; then
+    stty echo
+    printf '\n' >&2
+  fi
+  _token=$(printf '%s' "$_token" | tr -d '[:space:]')
+  [ -n "$_token" ] || die "no token entered"
+
+  secret_set "$_name" "$_token" || die "could not save the token to the keychain"
+  state_update '.accounts |= (if any(.[]; . == $n) then . else . + [$n] end)' --arg n "$_name" ||
+    die "could not update $STATE"
+  set_username "$_name" "$_token"
+}
+
+cmd_remove() {
+  [ $# -eq 1 ] || die "usage: roulette remove <name>"
+  require_account "$1"
+  secret_del "$1"
+  state_update '.accounts -= [$n] | del(.usernames[$n], .usage[$n]) | if .last == $n then del(.last) else . end' --arg n "$1" ||
+    die "could not update $STATE"
+  printf 'removed %s\n' "$1"
+}
+
+cmd_refresh() {
+  [ $# -eq 1 ] || [ $# -eq 2 ] || die "usage: roulette refresh <name> [email]"
+  require_account "$1"
+  if [ $# -eq 2 ]; then
+    state_update '.usernames[$n] = $u' --arg n "$1" --arg u "$2" || die "could not update $STATE"
+    printf '%s → %s\n' "$1" "$2"
+    return 0
+  fi
+  _token=$(secret_get "$1")
+  [ -n "$_token" ] || die "no keychain entry for '$1'. Re-add it with: roulette add $1 --force"
+  set_username "$1" "$_token"
+}
+
+# launch_account <name> [claude args...] — runs claude as that account, returns its exit code.
+# Other providers (see spec) would branch here.
+launch_account() {
+  _la_name=$1
+  shift
+  _la_token=$(secret_get "$_la_name")
+  [ -n "$_la_token" ] || die "no keychain entry for '$_la_name'. Re-add it with: roulette add $_la_name --force"
+  # An API key in the environment would take precedence over the account token.
+  unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN
+  CLAUDE_CODE_OAUTH_TOKEN=$_la_token ROULETTE_ACCOUNT=$_la_name claude "$@"
+}
+
+cmd_use() {
+  [ $# -ge 1 ] || die "usage: roulette use <name> [claude args...]"
+  _name=$1
+  shift
+  require_account "$_name"
+  state_update '.last = $n' --arg n "$_name" || true
+  _start=$(date +%s)
+  launch_account "$_name" "$@"
+  _rc=$?
+  if [ "$_rc" -ne 0 ] && [ $(($(date +%s) - _start)) -lt 5 ]; then
+    printf "roulette: claude exited right away. If the token for '%s' expired or was revoked, re-add it with: roulette add %s --force\n" "$_name" "$_name" >&2
+  fi
+  exit "$_rc"
+}
+
+# record_usage <name> <payload> — snapshot rate_limits from a status line payload.
+record_usage() {
+  has_account "$1" || return 0
+  _ru_snap=$(printf '%s' "$2" | jq -c --argjson now "$(now)" '
+    def num: if type == "number" then . else null end;
+    (.rate_limits // empty)
+    | {five_hour: (.five_hour.used_percentage | num),
+       seven_day: (.seven_day.used_percentage | num),
+       resets_at: (.five_hour.resets_at | num),
+       seen: $now}
+    | select(.five_hour != null or .seven_day != null)' 2>/dev/null) || return 0
+  [ -n "$_ru_snap" ] || return 0
+  state_update '.usage[$n] = $snap' --arg n "$1" --argjson snap "$_ru_snap"
+}
+
+# statusline-hook [-- cmd...] — must never break the user's status line: always exit 0.
+cmd_statusline_hook() {
+  _payload=$(cat)
+  _chained=0
+  _out=
+  if [ "${1:-}" = "--" ]; then
+    shift
+    _chained=1
+    if [ $# -gt 0 ]; then
+      _out=$(printf '%s' "$_payload" | "$@" 2>/dev/null)
+    fi
+  fi
+
+  _acct=${ROULETTE_ACCOUNT:-}
+  valid_name "$_acct" || _acct=
+  _have_jq=0
+  command -v jq >/dev/null 2>&1 && _have_jq=1
+
+  if [ -n "$_acct" ] && [ "$_have_jq" -eq 1 ]; then
+    (record_usage "$_acct" "$_payload") >/dev/null 2>&1
+  fi
+
+  if [ "$_chained" -eq 1 ]; then
+    if [ -z "$_acct" ]; then
+      printf '%s\n' "$_out"
+    elif [ -n "$_out" ]; then
+      printf '%s [%s]\n' "$_out" "$_acct"
+    else
+      printf '[%s]\n' "$_acct"
+    fi
+    return 0
+  fi
+
+  _bars=
+  if [ "$_have_jq" -eq 1 ]; then
+    _bars=$(printf '%s' "$_payload" | jq -r "$JQ_LIB"'
+      (.rate_limits // {}) as $r
+      | [ (if $r.five_hour.used_percentage != null
+           then "5h \(bar($r.five_hour.used_percentage)) \($r.five_hour.used_percentage | round)%"
+           else empty end),
+          (if $r.seven_day.used_percentage != null
+           then "7d \(bar($r.seven_day.used_percentage)) \($r.seven_day.used_percentage | round)%"
+           else empty end) ]
+      | join(" · ")' 2>/dev/null)
+  fi
+  _label=
+  [ -n "$_acct" ] && _label="[$_acct]"
+  if [ -n "$_label" ] && [ -n "$_bars" ]; then
+    printf '%s %s\n' "$_label" "$_bars"
+  else
+    printf '%s%s\n' "$_label" "$_bars"
+  fi
+  return 0
+}
+
+cmd_status() {
+  _st=$(state_read) || exit 1
+  printf '%s\n' "$_st" | jq -r --argjson now "$(now)" --arg cur "${ROULETTE_ACCOUNT:-}" "$JQ_LIB"'
+    rows($now) as $r
+    | if ($r | length) == 0 then "no accounts yet. Add one with: roulette add <name>"
+      else
+        ([$r[].name | length, 4] | max) as $nw
+        | ([$r[] | (.username // "(unknown)") | length, 8] | max) as $uw
+        | ("  " + ("NAME" | pad($nw)) + "  " + ("LOGIN" | pad($uw)) + "  " + ("5H" | pad(14)) + "  " + ("7D" | pad(14)) + "  SEEN"),
+          ($r[] | (if .name == $cur then "* " else "  " end)
+             + (.name | pad($nw)) + "  " + ((.username // "(unknown)") | pad($uw))
+             + "  " + cell(.five; .est5) + "  " + cell(.seven; .est7)
+             + "  " + (.seen | ago($now))),
+          (if any($r[]; .est5 or .est7) then "~ estimated: snapshot is older than the limit window" else empty end)
+      end'
+}
+
+cmd_next() {
+  _now=$(now)
+  _st=$(state_read) || exit 1
+  # Inside a session ROULETTE_ACCOUNT is set; from the parent shell, use the last account launched.
+  _cur=${ROULETTE_ACCOUNT:-$(printf '%s\n' "$_st" | jq -r '.last // empty')}
+  _names=$(printf '%s\n' "$_st" | jq -r --argjson now "$_now" --arg cur "$_cur" "$JQ_LIB"'ranked($now; $cur)[].name')
+
+  if [ -z "$_names" ]; then
+    printf '%s\n' "$_st" | jq -r --argjson now "$_now" --arg cur "$_cur" "$JQ_LIB"'
+      [rows($now)[] | select(.name != $cur)] as $o
+      | if ($o | length) == 0 then "roulette: no other accounts to switch to. Add one with: roulette add <name>"
+        else "roulette: every other account is at its 7-day limit. Soonest estimated reset: "
+          + ([$o[].seen | select(. != null) + 604800] | min | strflocaltime("%a %b %d %H:%M"))
+        end' >&2
+    exit 1
+  fi
+
+  printf '%s\n' "$_st" | jq -r --argjson now "$_now" --arg cur "$_cur" "$JQ_LIB"'
+    ranked($now; $cur) as $r
+    | ([$r[].name | length, 4] | max) as $nw
+    | ([$r[] | (.username // "(unknown)") | length, 8] | max) as $uw
+    | $r | to_entries[]
+    | "\(.key + 1)) " + (.value.name | pad($nw)) + "  " + ((.value.username // "(unknown)") | pad($uw))
+      + "  5h " + cell(.value.five; .value.est5) + "  7d " + cell(.value.seven; .value.est7)'
+
+  _default=$(printf '%s\n' "$_names" | head -n 1)
+  printf 'Switch to [%s]: ' "$_default" >&2
+  IFS= read -r _choice || _choice=
+  case $_choice in
+    '') _choice=$_default ;;
+    *[!0-9]*) ;;
+    *)
+      _choice=$(printf '%s\n' "$_names" | sed -n "${_choice}p")
+      [ -n "$_choice" ] || die "no account with that number"
+      ;;
+  esac
+  require_account "$_choice"
+  cmd_use "$_choice" --continue "$@"
+}
+
+usage() {
+  cat <<'EOF'
+roulette — switch Claude Code between your own subscription accounts
+
+  roulette add <name> [--force]          store an account's token (from `claude setup-token`)
+  roulette use <name> [claude args...]   launch claude on that account
+  roulette next [claude args...]         pick another account and continue the last conversation
+  roulette status                        usage per account
+  roulette list                          accounts and their logins
+  roulette refresh <name> [email]        re-detect an account's login, or set it by hand
+  roulette remove <name>                 forget an account
+  roulette statusline-hook [-- <cmd>...] status line integration (see README)
+EOF
+}
+
+main() {
+  _cmd=${1:-help}
+  [ $# -gt 0 ] && shift
+  case $_cmd in
+    help | -h | --help) usage; return 0 ;;
+    version | --version) printf 'roulette %s\n' "$ROULETTE_VERSION"; return 0 ;;
+    statusline-hook) cmd_statusline_hook "$@"; return 0 ;;
+  esac
+  need_jq
+  case $_cmd in
+    list) cmd_list "$@" ;;
+    add) cmd_add "$@" ;;
+    remove) cmd_remove "$@" ;;
+    refresh) cmd_refresh "$@" ;;
+    use) cmd_use "$@" ;;
+    status) cmd_status "$@" ;;
+    next) cmd_next "$@" ;;
+    *)
+      printf 'roulette: unknown command: %s\n\n' "$_cmd" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

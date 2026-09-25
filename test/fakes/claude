@@ -1,0 +1,17 @@
+#!/bin/sh
+# Test double for the claude CLI.
+if [ "${1:-}" = auth ] && [ "${2:-}" = status ]; then
+  [ -z "${FAKE_AUTH_FAIL:-}" ] || exit 1
+  if [ -n "${FAKE_AUTH_JSON:-}" ]; then printf '%s\n' "$FAKE_AUTH_JSON"; exit 0; fi
+  id=$(printf '%s' "${CLAUDE_CODE_OAUTH_TOKEN:-}" | cksum | cut -d' ' -f1)
+  printf '{"loggedIn":true,"email":"user-%s@example.com"}\n' "$id"
+  exit 0
+fi
+{
+  printf 'token=%s\n' "${CLAUDE_CODE_OAUTH_TOKEN:-}"
+  printf 'account=%s\n' "${ROULETTE_ACCOUNT:-}"
+  printf 'apikey=%s\n' "${ANTHROPIC_API_KEY:-}"
+  printf 'authtoken=%s\n' "${ANTHROPIC_AUTH_TOKEN:-}"
+  for a in "$@"; do printf 'arg=%s\n' "$a"; done
+} >> "$FAKE_CLAUDE_LOG"
+exit "${FAKE_CLAUDE_EXIT:-0}"

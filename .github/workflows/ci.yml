@@ -1,0 +1,13 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history, so the secret scan sees every commit
+      - run: brew install bats-core shellcheck gitleaks
+      - run: gitleaks git --no-banner
+      - run: shellcheck -s sh roulette install.sh test/fakes/security test/fakes/claude
+      - run: bats test/

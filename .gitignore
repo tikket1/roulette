@@ -1,0 +1,20 @@
+# Local agent/workflow scratch (ledgers, review packages)
+.superpowers/
+.claude/
+
+# roulette state, if ever pointed inside the repo (account names, logins, usage)
+state.json
+.lock/
+
+# Secrets — roulette never writes these, but never commit them by accident
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*token*.txt
+
+# OS / editor / logs
+.DS_Store
+*.swp
+*.log

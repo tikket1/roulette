@@ -1,0 +1,33 @@
+#!/bin/sh
+# Test double for macOS `security`, backed by files in $FAKE_KEYCHAIN.
+printf '%s\n' "$*" >> "$FAKE_KEYCHAIN/.argv"
+if [ "${1:-}" = -i ]; then
+  IFS= read -r line || exit 1
+  # shellcheck disable=SC2086
+  set -- $line
+fi
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+svc='' pw='' want_pw=0
+while [ $# -gt 0 ]; do
+  case $1 in
+    -s) svc=$2; shift 2 ;;
+    -a) shift 2 ;;
+    -w)
+      if [ "$cmd" = add-generic-password ]; then pw=$2; shift 2
+      else want_pw=1; shift
+      fi ;;
+    *) shift ;;
+  esac
+done
+file="$FAKE_KEYCHAIN/$(printf '%s' "$svc" | tr ':/' '__')"
+case $cmd in
+  add-generic-password) printf '%s' "$pw" > "$file" ;;
+  find-generic-password)
+    [ -f "$file" ] || exit 44
+    if [ "$want_pw" -eq 1 ]; then cat "$file"; echo; fi ;;
+  delete-generic-password)
+    [ -f "$file" ] || exit 44
+    rm -f "$file" ;;
+  *) exit 2 ;;
+esac
