@@ -201,7 +201,11 @@ roulette/
 ## Open items to verify during implementation
 
 - Whether the status line payload includes reset timestamps.
-- Which field of `claude auth status --json` holds the account email, and
+- RESOLVED 2026-09-26: with a `setup-token` token, `claude auth status --json`
+  returns only `loggedIn`, `authMethod`, `apiProvider`, `projectsDirectory`,
+  `configDirectory` — no email. `add` now prompts for the email when detection
+  finds none (detection is kept in case a later Claude Code adds it).
+- (original) Which field of `claude auth status --json` holds the account email, and
   whether it honors `CLAUDE_CODE_OAUTH_TOKEN` (vs. reading the stored login).
   If it does not honor the env var, fall back to prompting the user for the
   username at `add` time.

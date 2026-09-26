@@ -139,3 +139,17 @@ load helper
   run bash -c "printf 'tok-a\n' | '$RT' add a"
   [[ "$output" == *"roulette refresh a <email>"* ]] || false
 }
+
+@test "add asks for the login email when it can't be detected" {
+  export FAKE_AUTH_JSON='{"loggedIn":true,"authMethod":"oauth_token"}'
+  run bash -c "printf 'tok-a\nme@x.com\n' | '$RT' add a"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Login email for 'a'"* ]] || false
+  [[ "$output" == *"a → me@x.com"* ]] || false
+  [ "$(jq -r '.usernames.a' "$ROULETTE_CONFIG_DIR/state.json")" = "me@x.com" ]
+}
+
+@test "add does not ask for the email when it was detected" {
+  run bash -c "printf 'tok-a\n' | '$RT' add a"
+  [[ "$output" != *"Login email for"* ]] || false
+}

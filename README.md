@@ -29,8 +29,10 @@ rt add work
 ```
 
 roulette asks you to run `claude setup-token` in another terminal and sign in
-as that account, then paste the token. It detects the account's login email
-so you always see which account is which.
+as that account (a private browser window per account avoids mix-ups), then
+paste the token. It then asks for that account's login email, so `rt list` and
+`rt status` always show which account is which — Claude Code doesn't reveal
+the email for token logins, so roulette can't look it up itself.
 
 ## Use
 

@@ -165,9 +165,14 @@ detect_username() {
            | map(select(type == "string" and . != "")) | first // empty' 2>/dev/null
 }
 
-# set_username <name> <token>
+# set_username <name> <token> — detect the login and store it.
 set_username() {
-  _su_user=$(detect_username "$2")
+  store_username "$1" "$(detect_username "$2")"
+}
+
+# store_username <name> <email-or-empty>
+store_username() {
+  _su_user=$2
   if [ -z "$_su_user" ]; then
     state_update '.usernames[$n] = null' --arg n "$1" || die "could not update $STATE"
     printf "%s → (unknown — run 'roulette refresh %s', or set it with 'roulette refresh %s <email>')\n" "$1" "$1" "$1"
@@ -225,7 +230,15 @@ EOF
   secret_set "$_name" "$_token" || die "could not save the token to the keychain"
   state_update '.accounts |= (if any(.[]; . == $n) then . else . + [$n] end)' --arg n "$_name" ||
     die "could not update $STATE"
-  set_username "$_name" "$_token"
+
+  # setup-token logins don't expose the account email, so ask when it can't be detected.
+  _user=$(detect_username "$_token")
+  if [ -z "$_user" ]; then
+    printf "Login email for '%s' (shown by list/status; Enter to skip): " "$_name" >&2
+    IFS= read -r _user || _user=
+    _user=$(printf '%s' "$_user" | tr -d '[:space:]')
+  fi
+  store_username "$_name" "$_user"
 }
 
 cmd_remove() {
@@ -241,8 +254,7 @@ cmd_refresh() {
   [ $# -eq 1 ] || [ $# -eq 2 ] || die "usage: roulette refresh <name> [email]"
   require_account "$1"
   if [ $# -eq 2 ]; then
-    state_update '.usernames[$n] = $u' --arg n "$1" --arg u "$2" || die "could not update $STATE"
-    printf '%s → %s\n' "$1" "$2"
+    store_username "$1" "$2"
     return 0
   fi
   _token=$(secret_get "$1")
