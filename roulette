@@ -416,6 +416,23 @@ cmd_next() {
   cmd_use "$_choice" --continue "$@"
 }
 
+# whoami — which account is this session on? Run inside Claude Code as `!roulette whoami`.
+cmd_whoami() {
+  _acct=${ROULETTE_ACCOUNT:-}
+  if [ -z "$_acct" ]; then
+    if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+      printf 'not a roulette session: using an API key (ANTHROPIC_API_KEY)\n'
+    elif [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
+      printf 'not a roulette session: using a token set outside roulette (CLAUDE_CODE_OAUTH_TOKEN)\n'
+    else
+      printf "not a roulette session: using Claude Code's normal login\n"
+    fi
+    return 0
+  fi
+  _user=$(state_read | jq -r --arg n "$_acct" '.usernames[$n] // "(unknown)"')
+  printf '%s  %s\n' "$_acct" "$_user"
+}
+
 usage() {
   cat <<'EOF'
 roulette — switch Claude Code between your own subscription accounts
@@ -427,6 +444,7 @@ roulette — switch Claude Code between your own subscription accounts
   roulette list                          accounts and their logins
   roulette refresh <name> [email]        re-detect an account's login, or set it by hand
   roulette remove <name>                 forget an account
+  roulette whoami                        which account this session is on
   roulette statusline-hook [-- <cmd>...] status line integration (see README)
 EOF
 }
@@ -448,6 +466,7 @@ main() {
     use) cmd_use "$@" ;;
     status) cmd_status "$@" ;;
     next) cmd_next "$@" ;;
+    whoami) cmd_whoami "$@" ;;
     *)
       printf 'roulette: unknown command: %s\n\n' "$_cmd" >&2
       usage >&2
