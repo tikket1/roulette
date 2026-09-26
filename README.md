@@ -15,7 +15,7 @@ Switch to [org2]:
 Needs macOS, [jq](https://jqlang.github.io/jq/) and Claude Code.
 
 ```sh
-git clone <this repo> && cd roulette && ./install.sh
+git clone https://github.com/tikket1/roulette && cd roulette && ./install.sh
 ```
 
 This puts `roulette` and the shortcut `rt` in `~/.local/bin`.
