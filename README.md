@@ -44,25 +44,12 @@ the email for token logins, so roulette can't look it up itself.
 | `rt list` | Accounts and logins |
 | `rt refresh work [email]` | Re-detect a login, or set it by hand if detection gets it wrong |
 | `rt remove work` | Forget an account |
-| `rt whoami` | Which account this session is on — inside Claude Code, run `!rt whoami` |
 
 Everything after the account name is passed to `claude`, e.g. `rt use work --model sonnet`.
 
 All accounts share your normal `~/.claude` — settings, skills, plugins, memory
 and history — which is why `rt next` can pick up the conversation where you
 left it.
-
-Want a `/whoami` inside Claude Code? Save this as `~/.claude/commands/whoami.md`:
-
-```markdown
----
-description: Show which roulette account this session is using
-allowed-tools: Bash(roulette whoami)
----
-!`roulette whoami`
-
-Reply with only the line above, nothing else.
-```
 
 ## Usage in your status line
 
